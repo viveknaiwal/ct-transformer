@@ -358,12 +358,3 @@ if "pivot" in st.session_state:
         st.markdown(f"**Columns ({pivot.shape[1]}):** " +
             ", ".join(str(c) for c in list(pivot.columns)[:20]) +
             ("..." if pivot.shape[1] > 20 else ""))
-```
-
----
-
-**Also add `requirements.txt`** to your repo with:
-```
-streamlit
-pandas
-openpyxl
