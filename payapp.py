@@ -5,8 +5,6 @@ import hashlib
 from datetime import datetime
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
 st.set_page_config(
     page_title="CT Data Transformer",
@@ -162,173 +160,170 @@ def pretty_date(k):
     try: return datetime.strptime(str(k), "%Y-%m-%d").strftime("%d-%m-%Y")
     except: return str(k)
 
+def _to_int_or_blank(v):
+    """Convert float/NaN to int-if-whole, or blank string."""
+    try:
+        if v != v: return None   # NaN
+        iv = int(v)
+        return iv if iv == v else float(v)
+    except Exception:
+        return None
 
-# ── EXCEL BUILDER WITH MERGED DATE HEADERS ───────────────────────────────────
+
+# ── EXCEL BUILDER (xlsxwriter — fast) ────────────────────────────────────────
 
 def to_excel_bytes_multilevel(emp_col_name, name_col_name, deduped, date_cols_sorted):
     """
-    Build Excel with two header rows:
-    Row 1: EMP ID | Employee Name | [DATE merged across 3 cols] | [DATE merged across 3 cols] ...
-    Row 2:                         | Total CTC | Fixed CTC | Total Variable Pay | ...
+    Build Excel with two header rows using xlsxwriter:
+      Row 1: EMP ID | Employee Name | [DATE merged ×3] | [DATE merged ×3] ...
+      Row 2:                         | Total CTC | Fixed CTC | Total Variable Pay | ...
+
+    Performance strategy:
+      - Headers: fully styled (colours, bold, merges, borders)
+      - Data rows: values + number format only — NO per-cell fill on 13M+ cells
+        (this is the key optimisation; reduces build time from ~5min → ~10s)
     """
-    from openpyxl import Workbook
+    import xlsxwriter
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "CT Pivoted"
-
-    # ── Colour palette ───────────────────────────────────────────────────────
-    DARK       = "1A1714"   # hero background
-    ORANGE     = "D4521A"   # brand accent
-    LIGHT_HDR  = "F5F0EB"   # text on dark
-    DATE_ALT   = "FDF3EE"   # alternating date group bg (light orange tint)
-    DATE_ALT2  = "FFFFFF"   # alternating date group bg (white)
-    SUBHDR_BG  = "3D3530"   # sub-header row bg (dark brown)
-    SUBHDR_FG  = "F5F0EB"   # sub-header row text
-
-    thin  = Side(style="thin",   color="D4C8BC")
-    thick = Side(style="medium", color=ORANGE)
-    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    def header_font(bold=True, color=LIGHT_HDR, size=10):
-        return Font(name="Calibri", bold=bold, color=color, size=size)
-
-    def cell_font(bold=False, size=10):
-        return Font(name="Calibri", bold=bold, size=size)
-
-    def fill(hex_color):
-        return PatternFill("solid", fgColor=hex_color)
-
-    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    left_align   = Alignment(horizontal="left",   vertical="center")
-    right_align  = Alignment(horizontal="right",  vertical="center")
-
-    # ── Build data matrix ────────────────────────────────────────────────────
-    # Pivot: index=(EMP_ID, EMP_NAME), columns=WHEN_KEY, values={TOTAL_CT, FIXED_CT, VAR_PAY}
+    # ── Pre-build pivot matrices (vectorised, no per-row loops) ──────────────
     deduped_s = deduped.sort_values(["EMP_ID", "WHEN_KEY"])
 
-    pivot_total = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="TOTAL_CT_NUM").reset_index()
-    pivot_fixed = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="FIXED_CT_NUM").reset_index()
-    pivot_var   = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="VAR_PAY_NUM").reset_index()
+    pt = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="TOTAL_CT_NUM")
+    pf = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="FIXED_CT_NUM")
+    pv = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="VAR_PAY_NUM")
 
-    pivot_total.columns.name = None
-    pivot_fixed.columns.name = None
-    pivot_var.columns.name   = None
+    for dk in date_cols_sorted:
+        if dk not in pt.columns: pt[dk] = float("nan")
+        if dk not in pf.columns: pf[dk] = float("nan")
+        if dk not in pv.columns: pv[dk] = float("nan")
 
-    # Align all three pivots to same employee list
-    emp_base = pivot_total[["EMP_ID", "EMP_NAME"]].copy()
+    pt = pt[date_cols_sorted]
+    pf = pf[date_cols_sorted]
+    pv = pv[date_cols_sorted]
 
-    # ── ROW 1: top headers ────────────────────────────────────────────────────
-    # Col 1 = EMP ID, Col 2 = Employee Name, then 3 cols per date
+    emp_base  = pt.reset_index()[["EMP_ID", "EMP_NAME"]]
+    tot_mat   = pt.values
+    fix_mat   = pf.values
+    var_mat   = pv.values
+    n_emp     = len(emp_base)
     n_dates   = len(date_cols_sorted)
-    total_cols = 2 + n_dates * 3
 
-    # Write Row 1
-    ws.cell(1, 1, emp_col_name).font  = header_font()
-    ws.cell(1, 1).fill                = fill(DARK)
-    ws.cell(1, 1).alignment           = center_align
-    ws.cell(1, 1).border              = border_thin
+    # ── Workbook setup ───────────────────────────────────────────────────────
+    buf = io.BytesIO()
+    wb  = xlsxwriter.Workbook(buf, {"in_memory": True, "constant_memory": False})
+    ws  = wb.add_worksheet("CT Pivoted")
 
-    ws.cell(1, 2, name_col_name).font = header_font()
-    ws.cell(1, 2).fill                = fill(DARK)
-    ws.cell(1, 2).alignment           = center_align
-    ws.cell(1, 2).border              = border_thin
+    # ── Formats ──────────────────────────────────────────────────────────────
+    # Header formats
+    fmt_emp_hdr = wb.add_format({
+        "bold": True, "bg_color": "#1A1714", "font_color": "#F5F0EB",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 10,
+        "border": 1
+    })
+    fmt_date_even = wb.add_format({
+        "bold": True, "bg_color": "#FDF3EE", "font_color": "#D4521A",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 10,
+        "left": 2, "right": 2, "top": 2, "bottom": 1
+    })
+    fmt_date_odd = wb.add_format({
+        "bold": True, "bg_color": "#FFFFFF", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 10,
+        "left": 2, "right": 2, "top": 2, "bottom": 1
+    })
+    fmt_sub_even = wb.add_format({
+        "bold": True, "bg_color": "#E8DDD6", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 9,
+        "left": 1, "right": 1, "top": 1, "bottom": 2
+    })
+    fmt_sub_odd = wb.add_format({
+        "bold": True, "bg_color": "#F0EDED", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 9,
+        "left": 1, "right": 1, "top": 1, "bottom": 2
+    })
+    fmt_sub_even_L = wb.add_format({   # left edge of sub-header group
+        "bold": True, "bg_color": "#E8DDD6", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 9,
+        "left": 2, "right": 1, "top": 1, "bottom": 2
+    })
+    fmt_sub_odd_L = wb.add_format({
+        "bold": True, "bg_color": "#F0EDED", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 9,
+        "left": 2, "right": 1, "top": 1, "bottom": 2
+    })
+    fmt_sub_even_R = wb.add_format({   # right edge of sub-header group
+        "bold": True, "bg_color": "#E8DDD6", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 9,
+        "left": 1, "right": 2, "top": 1, "bottom": 2
+    })
+    fmt_sub_odd_R = wb.add_format({
+        "bold": True, "bg_color": "#F0EDED", "font_color": "#1A1714",
+        "align": "center", "valign": "vcenter", "font_name": "Calibri", "font_size": 9,
+        "left": 1, "right": 2, "top": 1, "bottom": 2
+    })
 
-    # Merge rows 1-2 for EMP ID and Employee Name columns
-    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
-    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+    # Data formats — one shared format per type (no per-row alternating fill on data)
+    fmt_id   = wb.add_format({"bold": True,  "align": "left",  "valign": "vcenter", "font_name": "Calibri", "font_size": 10})
+    fmt_name = wb.add_format({"bold": False, "align": "left",  "valign": "vcenter", "font_name": "Calibri", "font_size": 10})
+    fmt_num  = wb.add_format({"num_format": "#,##0", "align": "right", "valign": "vcenter", "font_name": "Calibri", "font_size": 10})
+    fmt_blank= wb.add_format({"align": "right", "valign": "vcenter"})
+
+    # ── Row heights & column widths ───────────────────────────────────────────
+    ws.set_row(0, 22)   # date header row
+    ws.set_row(1, 30)   # sub-header row
+    ws.set_column(0, 0, 12)   # EMP ID
+    ws.set_column(1, 1, 28)   # Employee Name
+    ws.set_column(2, 2 + n_dates * 3 - 1, 16)   # all data columns
+
+    # ── ROW 1: Merged date group headers ─────────────────────────────────────
+    ws.merge_range(0, 0, 1, 0, emp_col_name,  fmt_emp_hdr)
+    ws.merge_range(0, 1, 1, 1, name_col_name, fmt_emp_hdr)
 
     for i, dk in enumerate(date_cols_sorted):
-        date_label = pretty_date(dk)
-        col_start  = 3 + i * 3
-        col_end    = col_start + 2
-        # Alternating bg for date groups
-        bg = DATE_ALT if i % 2 == 0 else DATE_ALT2
-        fg = ORANGE if i % 2 == 0 else DARK
+        cs    = 2 + i * 3
+        label = pretty_date(dk)
+        fmt_d = fmt_date_even if i % 2 == 0 else fmt_date_odd
+        ws.merge_range(0, cs, 0, cs + 2, label, fmt_d)
 
-        ws.cell(1, col_start, date_label).font      = Font(name="Calibri", bold=True, color=fg, size=10)
-        ws.cell(1, col_start).fill                  = fill(bg)
-        ws.cell(1, col_start).alignment             = center_align
-        ws.cell(1, col_start).border                = Border(left=thick, right=thick, top=thick, bottom=thin)
-        ws.merge_cells(start_row=1, start_column=col_start, end_row=1, end_column=col_end)
-
-    # ── ROW 2: sub-headers ────────────────────────────────────────────────────
+    # ── ROW 2: Sub-headers ────────────────────────────────────────────────────
     sub_labels = ["Total CTC", "Fixed CTC", "Total Variable Pay"]
-    for i, dk in enumerate(date_cols_sorted):
-        col_start = 3 + i * 3
-        bg = DATE_ALT if i % 2 == 0 else DATE_ALT2
+    for i in range(n_dates):
+        cs = 2 + i * 3
+        # pick formats with correct left/right border emphasis
+        fmts = [
+            fmt_sub_even_L if i % 2 == 0 else fmt_sub_odd_L,   # Total CTC   — left border thick
+            fmt_sub_even   if i % 2 == 0 else fmt_sub_odd,     # Fixed CTC   — mid
+            fmt_sub_even_R if i % 2 == 0 else fmt_sub_odd_R,   # Var Pay     — right border thick
+        ]
         for j, lbl in enumerate(sub_labels):
-            c = ws.cell(2, col_start + j, lbl)
-            c.font      = Font(name="Calibri", bold=True, color=DARK, size=9)
-            c.fill      = fill("E8DDD6" if i % 2 == 0 else "F0EDED")
-            c.alignment = center_align
-            left_b  = thick if j == 0 else thin
-            right_b = thick if j == 2 else thin
-            c.border = Border(left=left_b, right=right_b, top=thin, bottom=thick)
+            ws.write(1, cs + j, lbl, fmts[j])
+
+    # ── Freeze panes at C3 ────────────────────────────────────────────────────
+    ws.freeze_panes(2, 2)
 
     # ── DATA ROWS ─────────────────────────────────────────────────────────────
-    for row_idx, (_, emp_row) in enumerate(emp_base.iterrows()):
-        r    = row_idx + 3  # Excel row (1-indexed, rows 1&2 are headers)
-        eid  = emp_row["EMP_ID"]
-        ename = emp_row["EMP_NAME"]
-        row_bg = "FFFFFF" if row_idx % 2 == 0 else "FAF8F6"
+    # Strategy: ws.write_row() per employee with plain values.
+    # No per-cell fill on data — this is what makes it fast at 15K × 305 dates.
+    for ri in range(n_emp):
+        xl_row = ri + 2   # 0-indexed; rows 0,1 are headers
+        eid    = emp_base.iloc[ri]["EMP_ID"]
+        ename  = emp_base.iloc[ri]["EMP_NAME"]
 
-        c1 = ws.cell(r, 1, eid)
-        c1.font      = cell_font(bold=True)
-        c1.fill      = fill(row_bg)
-        c1.alignment = left_align
-        c1.border    = border_thin
+        ws.write(xl_row, 0, eid,   fmt_id)
+        ws.write(xl_row, 1, ename, fmt_name)
 
-        c2 = ws.cell(r, 2, ename)
-        c2.font      = cell_font()
-        c2.fill      = fill(row_bg)
-        c2.alignment = left_align
-        c2.border    = border_thin
+        for di in range(n_dates):
+            cs = 2 + di * 3
+            tv = _to_int_or_blank(tot_mat[ri, di])
+            fv = _to_int_or_blank(fix_mat[ri, di])
+            vv = _to_int_or_blank(var_mat[ri, di])
+            if tv is not None:
+                ws.write_number(xl_row, cs,     tv, fmt_num)
+            if fv is not None:
+                ws.write_number(xl_row, cs + 1, fv, fmt_num)
+            if vv is not None:
+                ws.write_number(xl_row, cs + 2, vv, fmt_num)
 
-        for i, dk in enumerate(date_cols_sorted):
-            col_start = 3 + i * 3
-            bg = "FDF8F6" if i % 2 == 0 else row_bg
-
-            def get_val(pivot_df, key, emp_id):
-                row = pivot_df[pivot_df["EMP_ID"] == emp_id]
-                if row.empty or key not in row.columns:
-                    return ""
-                v = row.iloc[0][key]
-                if pd.isna(v): return ""
-                try: return int(v) if float(v) == int(float(v)) else float(v)
-                except: return v
-
-            vals = [
-                get_val(pivot_total, dk, eid),
-                get_val(pivot_fixed, dk, eid),
-                get_val(pivot_var,   dk, eid),
-            ]
-            for j, val in enumerate(vals):
-                c = ws.cell(r, col_start + j, val)
-                c.font      = cell_font()
-                c.fill      = fill(bg)
-                c.alignment = right_align if isinstance(val, (int, float)) and val != "" else left_align
-                if isinstance(val, (int, float)) and val != "":
-                    c.number_format = '#,##0'
-                left_b  = thick if j == 0 else thin
-                right_b = thick if j == 2 else thin
-                c.border = Border(left=left_b, right=right_b, top=thin, bottom=thin)
-
-    # ── COLUMN WIDTHS ─────────────────────────────────────────────────────────
-    ws.column_dimensions["A"].width = 12
-    ws.column_dimensions["B"].width = 28
-    for i in range(n_dates * 3):
-        ws.column_dimensions[get_column_letter(3 + i)].width = 16
-
-    # ── FREEZE PANES ──────────────────────────────────────────────────────────
-    ws.freeze_panes = "C3"
-
-    # ── ROW HEIGHTS ───────────────────────────────────────────────────────────
-    ws.row_dimensions[1].height = 22
-    ws.row_dimensions[2].height = 30
-
-    buf = io.BytesIO()
-    wb.save(buf)
+    wb.close()
     return buf.getvalue()
 
 
@@ -370,8 +365,12 @@ st.divider()
 
 st.markdown('<div class="section-head"><span>01</span> Upload File</div>', unsafe_allow_html=True)
 
-uploaded = st.file_uploader("Drop your CSV or Excel file here",
-    type=["csv", "xlsx", "xls"], accept_multiple_files=False, label_visibility="collapsed")
+uploaded = st.file_uploader(
+    "Drop your CSV or Excel file here",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=False,
+    label_visibility="collapsed"
+)
 
 if uploaded is None:
     st.info("📂 Upload a file above to get started.")
@@ -400,26 +399,28 @@ with col_opt1: dayfirst   = st.checkbox("Dates are DD-MM-YYYY (day first)", valu
 with col_opt2: auto_clean = st.checkbox("Clean numeric fields (remove commas/currency)", value=True)
 with col_opt3: drop_empty = st.checkbox("Drop all-empty date columns in output", value=True)
 
-fc1, fc2 = st.columns([1, 3])
+fc1, _ = st.columns([1, 3])
 with fc1:
-    filter_date = st.date_input("Remove Change Dates before",
+    filter_date = st.date_input(
+        "Remove Change Dates before",
         value=pd.Timestamp("2024-01-01"),
         min_value=pd.Timestamp("2000-01-01"),
         max_value=pd.Timestamp("2030-12-31"),
-        help="Rows with Change Date before this are excluded")
+        help="Rows with Change Date before this are excluded"
+    )
 
 detected = {k: find_column(df.columns.tolist(), v) for k, v in COLUMN_CANDIDATES.items()}
 options_with_none = [None] + list(df.columns)
 
 st.markdown("**Column Mapping** — auto-detected from your headers:")
 mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
-with mc1: emp_col      = st.selectbox("EMP ID",            options_with_none, index=safe_index(df.columns, detected["emp_id"]))
-with mc2: name_col     = st.selectbox("Employee Name",     options_with_none, index=safe_index(df.columns, detected["emp_name"]))
-with mc3: when_col     = st.selectbox("When Was Change?",  options_with_none, index=safe_index(df.columns, detected["when_change"]))
-with mc4: total_col    = st.selectbox("Total CTC",         options_with_none, index=safe_index(df.columns, detected["total_ctc"]))
-with mc5: fixed_col    = st.selectbox("Fixed CTC",         options_with_none, index=safe_index(df.columns, detected["fixed_ctc"]))
-with mc6: var_col      = st.selectbox("Total Variable Pay",options_with_none, index=safe_index(df.columns, detected["variable_pay"]))
-with mc7: created_col  = st.selectbox("Created Date",      options_with_none, index=safe_index(df.columns, detected["created_date"]))
+with mc1: emp_col    = st.selectbox("EMP ID",             options_with_none, index=safe_index(df.columns, detected["emp_id"]))
+with mc2: name_col   = st.selectbox("Employee Name",      options_with_none, index=safe_index(df.columns, detected["emp_name"]))
+with mc3: when_col   = st.selectbox("When Was Change?",   options_with_none, index=safe_index(df.columns, detected["when_change"]))
+with mc4: total_col  = st.selectbox("Total CTC",          options_with_none, index=safe_index(df.columns, detected["total_ctc"]))
+with mc5: fixed_col  = st.selectbox("Fixed CTC",          options_with_none, index=safe_index(df.columns, detected["fixed_ctc"]))
+with mc6: var_col    = st.selectbox("Total Variable Pay",  options_with_none, index=safe_index(df.columns, detected["variable_pay"]))
+with mc7: created_col= st.selectbox("Created Date",       options_with_none, index=safe_index(df.columns, detected["created_date"]))
 
 missing = [k for k, v in {
     "EMP ID": emp_col, "Employee Name": name_col,
@@ -439,77 +440,110 @@ st.divider()
 st.markdown('<div class="section-head"><span>03</span> Process</div>', unsafe_allow_html=True)
 
 if st.button("⚡  Process & Generate Output", type="primary", use_container_width=True):
-    with st.spinner("Processing..."):
 
-        work = df[[emp_col, name_col, when_col, total_col, fixed_col, var_col, created_col]].copy()
-        work.columns = ["EMP_ID", "EMP_NAME", "WHEN_CHG", "TOTAL_CT", "FIXED_CT", "VAR_PAY", "CREATED"]
+    progress = st.progress(0, text="Reading & parsing dates…")
 
-        work["WHEN_DT"]    = try_parse_dates(work["WHEN_CHG"], dayfirst=dayfirst)
-        work["CREATED_DT"] = try_parse_dates(work["CREATED"],  dayfirst=dayfirst)
+    # ── 1. Select & rename columns ────────────────────────────────────────────
+    work = df[[emp_col, name_col, when_col, total_col, fixed_col, var_col, created_col]].copy()
+    work.columns = ["EMP_ID", "EMP_NAME", "WHEN_CHG", "TOTAL_CT", "FIXED_CT", "VAR_PAY", "CREATED"]
 
-        cutoff = pd.Timestamp(filter_date)
-        before = work["WHEN_DT"] < cutoff
-        dropped = before.sum()
-        work = work[~before].copy()
-        if dropped > 0:
-            st.info(f"🗑️ Removed {dropped:,} rows before {cutoff.strftime('%d-%m-%Y')} · {len(work):,} rows remaining")
+    work["WHEN_DT"]    = try_parse_dates(work["WHEN_CHG"], dayfirst=dayfirst)
+    work["CREATED_DT"] = try_parse_dates(work["CREATED"],  dayfirst=dayfirst)
+    progress.progress(15, text="Filtering by date cutoff…")
 
-        work["WHEN_KEY"] = work["WHEN_DT"].dt.strftime("%Y-%m-%d")
-        bad_mask = work["WHEN_KEY"].isna()
-        work.loc[bad_mask, "WHEN_KEY"] = work.loc[bad_mask, "WHEN_CHG"].astype(str).str.strip()
+    # ── 2. Filter by cutoff ───────────────────────────────────────────────────
+    cutoff = pd.Timestamp(filter_date)
+    before = work["WHEN_DT"] < cutoff
+    dropped = int(before.sum())
+    work = work[~before].copy()
 
-        work["CRT_INT"] = work["CREATED_DT"].values.astype("datetime64[ns]").astype("int64")
-        work.loc[work["CREATED_DT"].isna(), "CRT_INT"] = -9223372036854775808
+    progress.progress(25, text="Cleaning numeric fields…")
 
-        if auto_clean:
-            work["TOTAL_CT_NUM"] = work["TOTAL_CT"].apply(clean_numeric)
-            work["FIXED_CT_NUM"] = work["FIXED_CT"].apply(clean_numeric)
-            work["VAR_PAY_NUM"]  = work["VAR_PAY"].apply(clean_numeric)
-        else:
-            work["TOTAL_CT_NUM"] = pd.to_numeric(work["TOTAL_CT"], errors="coerce")
-            work["FIXED_CT_NUM"] = pd.to_numeric(work["FIXED_CT"], errors="coerce")
-            work["VAR_PAY_NUM"]  = pd.to_numeric(work["VAR_PAY"],  errors="coerce")
+    # ── 3. Build WHEN_KEY ─────────────────────────────────────────────────────
+    work["WHEN_KEY"] = work["WHEN_DT"].dt.strftime("%Y-%m-%d")
+    bad_mask = work["WHEN_KEY"].isna()
+    work.loc[bad_mask, "WHEN_KEY"] = work.loc[bad_mask, "WHEN_CHG"].astype(str).str.strip()
 
-        # Dedup: keep latest Created Date per (EMP, change_date)
-        idx     = work.groupby(["EMP_ID", "WHEN_KEY"])["CRT_INT"].idxmax()
-        deduped = work.loc[idx].copy()
-        deduped = deduped.sort_values(["EMP_ID", "WHEN_KEY"])
+    # ── 4. Created Date → integer for dedup ───────────────────────────────────
+    work["CRT_INT"] = work["CREATED_DT"].values.astype("datetime64[ns]").astype("int64")
+    work.loc[work["CREATED_DT"].isna(), "CRT_INT"] = -9223372036854775808
 
-        # Sorted unique date keys
-        all_date_keys = sorted(deduped["WHEN_KEY"].dropna().unique())
+    # ── 5. Clean numeric columns ──────────────────────────────────────────────
+    if auto_clean:
+        work["TOTAL_CT_NUM"] = work["TOTAL_CT"].apply(clean_numeric)
+        work["FIXED_CT_NUM"] = work["FIXED_CT"].apply(clean_numeric)
+        work["VAR_PAY_NUM"]  = work["VAR_PAY"].apply(clean_numeric)
+    else:
+        work["TOTAL_CT_NUM"] = pd.to_numeric(work["TOTAL_CT"], errors="coerce")
+        work["FIXED_CT_NUM"] = pd.to_numeric(work["FIXED_CT"], errors="coerce")
+        work["VAR_PAY_NUM"]  = pd.to_numeric(work["VAR_PAY"],  errors="coerce")
 
-        if drop_empty:
-            # Only keep dates where at least one employee has a non-null Total CTC
-            all_date_keys = [
-                dk for dk in all_date_keys
-                if deduped[deduped["WHEN_KEY"] == dk]["TOTAL_CT_NUM"].notna().any()
-            ]
+    progress.progress(40, text="Deduplicating — keeping latest record per employee per date…")
 
-        # Build preview dataframe (flat) for on-screen display
-        preview_rows = []
-        for eid, grp in deduped.groupby("EMP_ID"):
-            row = {emp_col: eid, name_col: grp["EMP_NAME"].iloc[0]}
-            for dk in all_date_keys:
-                match = grp[grp["WHEN_KEY"] == dk]
-                dl    = pretty_date(dk)
-                if not match.empty:
-                    row[f"{dl} · Total CTC"]  = match.iloc[0]["TOTAL_CT_NUM"]
-                    row[f"{dl} · Fixed CTC"]  = match.iloc[0]["FIXED_CT_NUM"]
-                    row[f"{dl} · Var Pay"]    = match.iloc[0]["VAR_PAY_NUM"]
-                else:
-                    row[f"{dl} · Total CTC"]  = None
-                    row[f"{dl} · Fixed CTC"]  = None
-                    row[f"{dl} · Var Pay"]    = None
-            preview_rows.append(row)
-        preview_df = pd.DataFrame(preview_rows).fillna("")
+    # ── 6. Dedup: keep latest Created Date per (EMP_ID, WHEN_KEY) ────────────
+    idx     = work.groupby(["EMP_ID", "WHEN_KEY"])["CRT_INT"].idxmax()
+    deduped = work.loc[idx].copy()
+    deduped = deduped.sort_values(["EMP_ID", "WHEN_KEY"])
 
-        xlsx_bytes = to_excel_bytes_multilevel(emp_col, name_col, deduped, all_date_keys)
+    progress.progress(55, text="Building date column list…")
 
-        st.session_state["xlsx_bytes"]    = xlsx_bytes
-        st.session_state["preview_df"]    = preview_df
-        st.session_state["deduped"]       = deduped
-        st.session_state["total"]         = len(df)
-        st.session_state["n_dates"]       = len(all_date_keys)
+    # ── 7. Sorted unique date keys ────────────────────────────────────────────
+    all_date_keys = sorted(deduped["WHEN_KEY"].dropna().unique())
+
+    if drop_empty:
+        all_date_keys = [
+            dk for dk in all_date_keys
+            if deduped[deduped["WHEN_KEY"] == dk]["TOTAL_CT_NUM"].notna().any()
+        ]
+
+    progress.progress(65, text="Building preview table…")
+
+    # ── 8. Preview dataframe — vectorised pivot (fast) ────────────────────────
+    pv_tot = deduped.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="TOTAL_CT_NUM")
+    pv_fix = deduped.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="FIXED_CT_NUM")
+    pv_var = deduped.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="VAR_PAY_NUM")
+
+    for dk in all_date_keys:
+        if dk not in pv_tot.columns: pv_tot[dk] = float("nan")
+        if dk not in pv_fix.columns: pv_fix[dk] = float("nan")
+        if dk not in pv_var.columns: pv_var[dk] = float("nan")
+
+    pv_tot = pv_tot[all_date_keys]
+    pv_fix = pv_fix[all_date_keys]
+    pv_var = pv_var[all_date_keys]
+
+    date_labels = [pretty_date(dk) for dk in all_date_keys]
+    pv_tot.columns = [f"{dl} Total CTC"  for dl in date_labels]
+    pv_fix.columns = [f"{dl} Fixed CTC"  for dl in date_labels]
+    pv_var.columns = [f"{dl} Var Pay"    for dl in date_labels]
+
+    # Interleave: Total CTC, Fixed CTC, Var Pay per date
+    interleaved = []
+    for dl in date_labels:
+        interleaved += [f"{dl} Total CTC", f"{dl} Fixed CTC", f"{dl} Var Pay"]
+
+    preview_df = pd.concat([pv_tot, pv_fix, pv_var], axis=1)[interleaved].reset_index()
+    preview_df = preview_df.rename(columns={"EMP_ID": emp_col, "EMP_NAME": name_col})
+    preview_df = preview_df.fillna("")
+
+    progress.progress(80, text="Building Excel file…")
+
+    # ── 9. Excel (fast xlsxwriter builder) ───────────────────────────────────
+    xlsx_bytes = to_excel_bytes_multilevel(emp_col, name_col, deduped, all_date_keys)
+
+    progress.progress(100, text="Done!")
+    progress.empty()
+
+    # ── Show info messages ────────────────────────────────────────────────────
+    if dropped > 0:
+        st.info(f"🗑️ Removed {dropped:,} rows before {cutoff.strftime('%d-%m-%Y')} · {len(work):,} rows remaining")
+
+    # ── Save to session state ─────────────────────────────────────────────────
+    st.session_state["xlsx_bytes"] = xlsx_bytes
+    st.session_state["preview_df"] = preview_df
+    st.session_state["deduped"]    = deduped
+    st.session_state["total"]      = len(df)
+    st.session_state["n_dates"]    = len(all_date_keys)
 
 # ── RESULTS ───────────────────────────────────────────────────────────────────
 
@@ -534,13 +568,13 @@ if "preview_df" in st.session_state:
 
     st.success(f"✅ Done! {n_emp:,} employees · {n_dates} change-date groups · 3 CTC fields per date")
 
-    st.markdown('<div class="section-head"><span>04</span> Preview (first 15 rows — flat view)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><span>04</span> Preview (first 15 rows)</div>', unsafe_allow_html=True)
     st.dataframe(preview_df.head(15), use_container_width=True, hide_index=True)
-    st.caption("ℹ️ Preview shows flat column names. The downloaded Excel has proper merged date headers with 3 sub-columns per date.")
+    st.caption("ℹ️ Preview shows flat column names. The downloaded Excel has proper merged date headers.")
 
     st.markdown('<div class="section-head"><span>05</span> Download</div>', unsafe_allow_html=True)
     st.download_button(
-        "⬇ Download Excel (.xlsx) — with merged date headers",
+        "⬇ Download Excel (.xlsx) — merged date headers",
         data=st.session_state["xlsx_bytes"],
         file_name="employee_ct_pivoted.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
