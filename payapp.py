@@ -5,6 +5,8 @@ import hashlib
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(
     page_title="CT Data Transformer",
@@ -63,20 +65,10 @@ hr { border-color: #e5e1db !important; }
 ADMIN_EMAIL = "vivek.naiwal@cars24.com"
 
 def get_users():
-    """
-    Load users from st.secrets.
-    secrets.toml format:
-        [users]
-        "vivek.naiwal@cars24.com" = "Vivek@007"
-        "payroll1@cars24.com"     = "Pass@123"
-    """
     try:
         return {k.strip().lower(): v for k, v in dict(st.secrets["users"]).items()}
     except Exception:
-        # Hardcoded fallback — only used locally, never in production
-        return {
-            "vivek.naiwal@cars24.com": "Vivek@007"
-        }
+        return {"vivek.naiwal@cars24.com": "Vivek@007"}
 
 def check_login(email, password):
     users = get_users()
@@ -127,7 +119,9 @@ COLUMN_CANDIDATES = {
     "emp_id":       ["emp id", "empid", "employee id", "ecode", "emp_id", "employee_code"],
     "emp_name":     ["employee name", "name", "emp name", "employee"],
     "when_change":  ["when was the change", "when_was_the_change", "effective date", "when changed", "change date", "whenchange"],
-    "total_ctc":    ["total ct", "total ctc", "ctc", "total_ct", "total"],
+    "total_ctc":    ["total ctc", "total ct", "ctc", "total_ctc", "total_ct", "total"],
+    "fixed_ctc":    ["fixed ctc", "fixed_ctc", "fixed ct", "fixed salary", "fixed"],
+    "variable_pay": ["total variable pay", "variable pay", "total_variable_pay", "variable", "var pay"],
     "created_date": ["created date", "created_date", "created on", "created", "created_at", "createdat"]
 }
 
@@ -152,27 +146,191 @@ def try_parse_dates(series, dayfirst=True):
             parsed = alt
     return parsed
 
-def clean_ctc(x):
+def clean_numeric(x):
     if pd.isna(x): return pd.NA
     if isinstance(x, (int, float)): return x
     s = re.sub(r"[^\d\.\-]", "", str(x).strip())
     try: return float(s)
     except: return pd.NA
 
-def to_excel_bytes(df):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="CT Pivoted")
-        ws = writer.sheets["CT Pivoted"]
-        for col in ws.columns:
-            max_len = max((len(str(cell.value)) if cell.value else 0) for cell in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 30)
-    return buf.getvalue()
-
 def safe_index(columns, value):
     if value is None: return 0
     try: return list(columns).index(value) + 1
     except: return 0
+
+def pretty_date(k):
+    try: return datetime.strptime(str(k), "%Y-%m-%d").strftime("%d-%m-%Y")
+    except: return str(k)
+
+
+# ── EXCEL BUILDER WITH MERGED DATE HEADERS ───────────────────────────────────
+
+def to_excel_bytes_multilevel(emp_col_name, name_col_name, deduped, date_cols_sorted):
+    """
+    Build Excel with two header rows:
+    Row 1: EMP ID | Employee Name | [DATE merged across 3 cols] | [DATE merged across 3 cols] ...
+    Row 2:                         | Total CTC | Fixed CTC | Total Variable Pay | ...
+    """
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "CT Pivoted"
+
+    # ── Colour palette ───────────────────────────────────────────────────────
+    DARK       = "1A1714"   # hero background
+    ORANGE     = "D4521A"   # brand accent
+    LIGHT_HDR  = "F5F0EB"   # text on dark
+    DATE_ALT   = "FDF3EE"   # alternating date group bg (light orange tint)
+    DATE_ALT2  = "FFFFFF"   # alternating date group bg (white)
+    SUBHDR_BG  = "3D3530"   # sub-header row bg (dark brown)
+    SUBHDR_FG  = "F5F0EB"   # sub-header row text
+
+    thin  = Side(style="thin",   color="D4C8BC")
+    thick = Side(style="medium", color=ORANGE)
+    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def header_font(bold=True, color=LIGHT_HDR, size=10):
+        return Font(name="Calibri", bold=bold, color=color, size=size)
+
+    def cell_font(bold=False, size=10):
+        return Font(name="Calibri", bold=bold, size=size)
+
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align   = Alignment(horizontal="left",   vertical="center")
+    right_align  = Alignment(horizontal="right",  vertical="center")
+
+    # ── Build data matrix ────────────────────────────────────────────────────
+    # Pivot: index=(EMP_ID, EMP_NAME), columns=WHEN_KEY, values={TOTAL_CT, FIXED_CT, VAR_PAY}
+    deduped_s = deduped.sort_values(["EMP_ID", "WHEN_KEY"])
+
+    pivot_total = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="TOTAL_CT_NUM").reset_index()
+    pivot_fixed = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="FIXED_CT_NUM").reset_index()
+    pivot_var   = deduped_s.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_KEY", values="VAR_PAY_NUM").reset_index()
+
+    pivot_total.columns.name = None
+    pivot_fixed.columns.name = None
+    pivot_var.columns.name   = None
+
+    # Align all three pivots to same employee list
+    emp_base = pivot_total[["EMP_ID", "EMP_NAME"]].copy()
+
+    # ── ROW 1: top headers ────────────────────────────────────────────────────
+    # Col 1 = EMP ID, Col 2 = Employee Name, then 3 cols per date
+    n_dates   = len(date_cols_sorted)
+    total_cols = 2 + n_dates * 3
+
+    # Write Row 1
+    ws.cell(1, 1, emp_col_name).font  = header_font()
+    ws.cell(1, 1).fill                = fill(DARK)
+    ws.cell(1, 1).alignment           = center_align
+    ws.cell(1, 1).border              = border_thin
+
+    ws.cell(1, 2, name_col_name).font = header_font()
+    ws.cell(1, 2).fill                = fill(DARK)
+    ws.cell(1, 2).alignment           = center_align
+    ws.cell(1, 2).border              = border_thin
+
+    # Merge rows 1-2 for EMP ID and Employee Name columns
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+
+    for i, dk in enumerate(date_cols_sorted):
+        date_label = pretty_date(dk)
+        col_start  = 3 + i * 3
+        col_end    = col_start + 2
+        # Alternating bg for date groups
+        bg = DATE_ALT if i % 2 == 0 else DATE_ALT2
+        fg = ORANGE if i % 2 == 0 else DARK
+
+        ws.cell(1, col_start, date_label).font      = Font(name="Calibri", bold=True, color=fg, size=10)
+        ws.cell(1, col_start).fill                  = fill(bg)
+        ws.cell(1, col_start).alignment             = center_align
+        ws.cell(1, col_start).border                = Border(left=thick, right=thick, top=thick, bottom=thin)
+        ws.merge_cells(start_row=1, start_column=col_start, end_row=1, end_column=col_end)
+
+    # ── ROW 2: sub-headers ────────────────────────────────────────────────────
+    sub_labels = ["Total CTC", "Fixed CTC", "Total Variable Pay"]
+    for i, dk in enumerate(date_cols_sorted):
+        col_start = 3 + i * 3
+        bg = DATE_ALT if i % 2 == 0 else DATE_ALT2
+        for j, lbl in enumerate(sub_labels):
+            c = ws.cell(2, col_start + j, lbl)
+            c.font      = Font(name="Calibri", bold=True, color=DARK, size=9)
+            c.fill      = fill("E8DDD6" if i % 2 == 0 else "F0EDED")
+            c.alignment = center_align
+            left_b  = thick if j == 0 else thin
+            right_b = thick if j == 2 else thin
+            c.border = Border(left=left_b, right=right_b, top=thin, bottom=thick)
+
+    # ── DATA ROWS ─────────────────────────────────────────────────────────────
+    for row_idx, (_, emp_row) in enumerate(emp_base.iterrows()):
+        r    = row_idx + 3  # Excel row (1-indexed, rows 1&2 are headers)
+        eid  = emp_row["EMP_ID"]
+        ename = emp_row["EMP_NAME"]
+        row_bg = "FFFFFF" if row_idx % 2 == 0 else "FAF8F6"
+
+        c1 = ws.cell(r, 1, eid)
+        c1.font      = cell_font(bold=True)
+        c1.fill      = fill(row_bg)
+        c1.alignment = left_align
+        c1.border    = border_thin
+
+        c2 = ws.cell(r, 2, ename)
+        c2.font      = cell_font()
+        c2.fill      = fill(row_bg)
+        c2.alignment = left_align
+        c2.border    = border_thin
+
+        for i, dk in enumerate(date_cols_sorted):
+            col_start = 3 + i * 3
+            bg = "FDF8F6" if i % 2 == 0 else row_bg
+
+            def get_val(pivot_df, key, emp_id):
+                row = pivot_df[pivot_df["EMP_ID"] == emp_id]
+                if row.empty or key not in row.columns:
+                    return ""
+                v = row.iloc[0][key]
+                if pd.isna(v): return ""
+                try: return int(v) if float(v) == int(float(v)) else float(v)
+                except: return v
+
+            vals = [
+                get_val(pivot_total, dk, eid),
+                get_val(pivot_fixed, dk, eid),
+                get_val(pivot_var,   dk, eid),
+            ]
+            for j, val in enumerate(vals):
+                c = ws.cell(r, col_start + j, val)
+                c.font      = cell_font()
+                c.fill      = fill(bg)
+                c.alignment = right_align if isinstance(val, (int, float)) and val != "" else left_align
+                if isinstance(val, (int, float)) and val != "":
+                    c.number_format = '#,##0'
+                left_b  = thick if j == 0 else thin
+                right_b = thick if j == 2 else thin
+                c.border = Border(left=left_b, right=right_b, top=thin, bottom=thin)
+
+    # ── COLUMN WIDTHS ─────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 28
+    for i in range(n_dates * 3):
+        ws.column_dimensions[get_column_letter(3 + i)].width = 16
+
+    # ── FREEZE PANES ──────────────────────────────────────────────────────────
+    ws.freeze_panes = "C3"
+
+    # ── ROW HEIGHTS ───────────────────────────────────────────────────────────
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 30
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 
 # ── HERO ──────────────────────────────────────────────────────────────────────
 
@@ -183,7 +341,7 @@ st.markdown(f"""
   <div class="hero-label">Payroll Internal Tool</div>
   <div class="hero-title">CT Data <strong>Transformer</strong></div>
   <div class="hero-sub">Upload your employee CT file. Keeps the latest record per change date
-  and pivots — one row per employee, each change date as a column.</div>
+  and pivots — one row per employee, each change date as a grouped column (Total CTC · Fixed CTC · Variable Pay).</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -194,7 +352,6 @@ with signout_col:
             del st.session_state[k]
         st.rerun()
 
-# Admin panel — only vivek sees this
 if is_admin:
     with st.expander("⚙️ Admin — Manage Users", expanded=False):
         st.markdown("**Add/remove users in Streamlit Secrets** → [users] section:")
@@ -204,8 +361,8 @@ if is_admin:
 "payroll2@cars24.com"     = "Password2"
 "manager@cars24.com"      = "Password3"
 """, language="toml")
-        st.info("Go to Streamlit Cloud → your app → ⋮ → Settings → Secrets to add/remove users. Changes apply immediately on next login.")
-        st.markdown("**Currently signed-in user:** " + user_email + "")
+        st.info("Go to Streamlit Cloud → your app → ⋮ → Settings → Secrets to add/remove users.")
+        st.markdown("**Currently signed-in user:** " + user_email)
 
 st.divider()
 
@@ -226,6 +383,7 @@ try:
         df = pd.read_csv(io.BytesIO(raw_bytes), dtype=str)
     else:
         df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+    df.columns = [c.strip() for c in df.columns]
 except Exception as e:
     st.error(f"❌ Failed to read file: {e}")
     st.stop()
@@ -239,8 +397,8 @@ st.markdown('<div class="section-head"><span>02</span> Configure</div>', unsafe_
 
 col_opt1, col_opt2, col_opt3 = st.columns(3)
 with col_opt1: dayfirst   = st.checkbox("Dates are DD-MM-YYYY (day first)", value=True)
-with col_opt2: auto_clean = st.checkbox("Clean Total CT (remove commas/currency)", value=True)
-with col_opt3: drop_empty = st.checkbox("Drop all-empty columns in output", value=True)
+with col_opt2: auto_clean = st.checkbox("Clean numeric fields (remove commas/currency)", value=True)
+with col_opt3: drop_empty = st.checkbox("Drop all-empty date columns in output", value=True)
 
 fc1, fc2 = st.columns([1, 3])
 with fc1:
@@ -250,19 +408,26 @@ with fc1:
         max_value=pd.Timestamp("2030-12-31"),
         help="Rows with Change Date before this are excluded")
 
-st.markdown("**Column Mapping** — auto-detected from your headers:")
 detected = {k: find_column(df.columns.tolist(), v) for k, v in COLUMN_CANDIDATES.items()}
 options_with_none = [None] + list(df.columns)
 
-mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-with mc1: emp_col     = st.selectbox("EMP ID",           options_with_none, index=safe_index(df.columns, detected["emp_id"]))
-with mc2: name_col    = st.selectbox("Employee Name",    options_with_none, index=safe_index(df.columns, detected["emp_name"]))
-with mc3: when_col    = st.selectbox("When Was Change?", options_with_none, index=safe_index(df.columns, detected["when_change"]))
-with mc4: ct_col      = st.selectbox("Total CT",         options_with_none, index=safe_index(df.columns, detected["total_ctc"]))
-with mc5: created_col = st.selectbox("Created Date",     options_with_none, index=safe_index(df.columns, detected["created_date"]))
+st.markdown("**Column Mapping** — auto-detected from your headers:")
+mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
+with mc1: emp_col      = st.selectbox("EMP ID",            options_with_none, index=safe_index(df.columns, detected["emp_id"]))
+with mc2: name_col     = st.selectbox("Employee Name",     options_with_none, index=safe_index(df.columns, detected["emp_name"]))
+with mc3: when_col     = st.selectbox("When Was Change?",  options_with_none, index=safe_index(df.columns, detected["when_change"]))
+with mc4: total_col    = st.selectbox("Total CTC",         options_with_none, index=safe_index(df.columns, detected["total_ctc"]))
+with mc5: fixed_col    = st.selectbox("Fixed CTC",         options_with_none, index=safe_index(df.columns, detected["fixed_ctc"]))
+with mc6: var_col      = st.selectbox("Total Variable Pay",options_with_none, index=safe_index(df.columns, detected["variable_pay"]))
+with mc7: created_col  = st.selectbox("Created Date",      options_with_none, index=safe_index(df.columns, detected["created_date"]))
 
-missing = [k for k, v in {"EMP ID": emp_col, "Employee Name": name_col,
-    "When Was Change?": when_col, "Total CT": ct_col, "Created Date": created_col}.items() if not v]
+missing = [k for k, v in {
+    "EMP ID": emp_col, "Employee Name": name_col,
+    "When Was Change?": when_col, "Total CTC": total_col,
+    "Fixed CTC": fixed_col, "Total Variable Pay": var_col,
+    "Created Date": created_col
+}.items() if not v]
+
 if missing:
     st.error(f"❌ Please map these columns: {', '.join(missing)}")
     st.stop()
@@ -275,8 +440,9 @@ st.markdown('<div class="section-head"><span>03</span> Process</div>', unsafe_al
 
 if st.button("⚡  Process & Generate Output", type="primary", use_container_width=True):
     with st.spinner("Processing..."):
-        work = df[[emp_col, name_col, when_col, ct_col, created_col]].copy()
-        work.columns = ["EMP_ID", "EMP_NAME", "WHEN_CHG", "TOTAL_CT", "CREATED"]
+
+        work = df[[emp_col, name_col, when_col, total_col, fixed_col, var_col, created_col]].copy()
+        work.columns = ["EMP_ID", "EMP_NAME", "WHEN_CHG", "TOTAL_CT", "FIXED_CT", "VAR_PAY", "CREATED"]
 
         work["WHEN_DT"]    = try_parse_dates(work["WHEN_CHG"], dayfirst=dayfirst)
         work["CREATED_DT"] = try_parse_dates(work["CREATED"],  dayfirst=dayfirst)
@@ -296,53 +462,64 @@ if st.button("⚡  Process & Generate Output", type="primary", use_container_wid
         work.loc[work["CREATED_DT"].isna(), "CRT_INT"] = -9223372036854775808
 
         if auto_clean:
-            work["CT_NUM"]   = work["TOTAL_CT"].apply(clean_ctc)
-            work["CT_FINAL"] = work["CT_NUM"].where(work["CT_NUM"].notna(), work["TOTAL_CT"])
+            work["TOTAL_CT_NUM"] = work["TOTAL_CT"].apply(clean_numeric)
+            work["FIXED_CT_NUM"] = work["FIXED_CT"].apply(clean_numeric)
+            work["VAR_PAY_NUM"]  = work["VAR_PAY"].apply(clean_numeric)
         else:
-            work["CT_FINAL"] = work["TOTAL_CT"]
+            work["TOTAL_CT_NUM"] = pd.to_numeric(work["TOTAL_CT"], errors="coerce")
+            work["FIXED_CT_NUM"] = pd.to_numeric(work["FIXED_CT"], errors="coerce")
+            work["VAR_PAY_NUM"]  = pd.to_numeric(work["VAR_PAY"],  errors="coerce")
 
+        # Dedup: keep latest Created Date per (EMP, change_date)
         idx     = work.groupby(["EMP_ID", "WHEN_KEY"])["CRT_INT"].idxmax()
         deduped = work.loc[idx].copy()
-
-        def pretty(k):
-            try: return datetime.strptime(str(k), "%Y-%m-%d").strftime("%d-%m-%Y")
-            except: return str(k)
-
-        deduped["WHEN_PRETTY"] = deduped["WHEN_KEY"].apply(pretty)
         deduped = deduped.sort_values(["EMP_ID", "WHEN_KEY"])
 
-        pivot = deduped.pivot(index=["EMP_ID", "EMP_NAME"], columns="WHEN_PRETTY", values="CT_FINAL").reset_index()
-        pivot.columns.name = None
-
-        date_cols, other_cols = [], []
-        for c in pivot.columns:
-            if c in ["EMP_ID", "EMP_NAME"]: continue
-            try: datetime.strptime(str(c), "%d-%m-%Y"); date_cols.append(c)
-            except: other_cols.append(c)
-
-        date_cols = sorted(date_cols, key=lambda x: datetime.strptime(x, "%d-%m-%Y"))
-        pivot = pivot[["EMP_ID", "EMP_NAME"] + date_cols + other_cols]
-        pivot = pivot.rename(columns={"EMP_ID": emp_col, "EMP_NAME": name_col})
+        # Sorted unique date keys
+        all_date_keys = sorted(deduped["WHEN_KEY"].dropna().unique())
 
         if drop_empty:
-            pivot = pivot.dropna(axis=1, how="all")
-        pivot = pivot.fillna("")
+            # Only keep dates where at least one employee has a non-null Total CTC
+            all_date_keys = [
+                dk for dk in all_date_keys
+                if deduped[deduped["WHEN_KEY"] == dk]["TOTAL_CT_NUM"].notna().any()
+            ]
 
-        st.session_state["xlsx_bytes"] = to_excel_bytes(pivot)
-        st.session_state["csv_bytes"]  = pivot.to_csv(index=False).encode("utf-8")
-        st.session_state["pivot"]      = pivot
-        st.session_state["deduped"]    = deduped
-        st.session_state["total"]      = len(df)
+        # Build preview dataframe (flat) for on-screen display
+        preview_rows = []
+        for eid, grp in deduped.groupby("EMP_ID"):
+            row = {emp_col: eid, name_col: grp["EMP_NAME"].iloc[0]}
+            for dk in all_date_keys:
+                match = grp[grp["WHEN_KEY"] == dk]
+                dl    = pretty_date(dk)
+                if not match.empty:
+                    row[f"{dl} · Total CTC"]  = match.iloc[0]["TOTAL_CT_NUM"]
+                    row[f"{dl} · Fixed CTC"]  = match.iloc[0]["FIXED_CT_NUM"]
+                    row[f"{dl} · Var Pay"]    = match.iloc[0]["VAR_PAY_NUM"]
+                else:
+                    row[f"{dl} · Total CTC"]  = None
+                    row[f"{dl} · Fixed CTC"]  = None
+                    row[f"{dl} · Var Pay"]    = None
+            preview_rows.append(row)
+        preview_df = pd.DataFrame(preview_rows).fillna("")
+
+        xlsx_bytes = to_excel_bytes_multilevel(emp_col, name_col, deduped, all_date_keys)
+
+        st.session_state["xlsx_bytes"]    = xlsx_bytes
+        st.session_state["preview_df"]    = preview_df
+        st.session_state["deduped"]       = deduped
+        st.session_state["total"]         = len(df)
+        st.session_state["n_dates"]       = len(all_date_keys)
 
 # ── RESULTS ───────────────────────────────────────────────────────────────────
 
-if "pivot" in st.session_state:
-    pivot   = st.session_state["pivot"]
-    deduped = st.session_state["deduped"]
-    total   = st.session_state["total"]
+if "preview_df" in st.session_state:
+    preview_df = st.session_state["preview_df"]
+    deduped    = st.session_state["deduped"]
+    total      = st.session_state["total"]
+    n_dates    = st.session_state["n_dates"]
 
-    n_emp   = pivot.shape[0]
-    n_dates = pivot.shape[1] - 2
+    n_emp   = len(preview_df)
     n_dedup = len(deduped)
 
     st.divider()
@@ -351,32 +528,33 @@ if "pivot" in st.session_state:
       <div class="metric-card"><div class="metric-val">{total:,}</div><div class="metric-label">Input Rows</div></div>
       <div class="metric-card"><div class="metric-val">{n_dedup:,}</div><div class="metric-label">After Dedup</div></div>
       <div class="metric-card"><div class="metric-val">{n_emp:,}</div><div class="metric-label">Employees</div></div>
-      <div class="metric-card"><div class="metric-val">{n_dates}</div><div class="metric-label">Date Columns</div></div>
+      <div class="metric-card"><div class="metric-val">{n_dates}</div><div class="metric-label">Date Groups</div></div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.success(f"✅ Done! {n_emp:,} employees · {n_dates} change-date columns · {pivot.shape[1]} total columns")
+    st.success(f"✅ Done! {n_emp:,} employees · {n_dates} change-date groups · 3 CTC fields per date")
 
-    st.markdown('<div class="section-head"><span>04</span> Preview (first 15 rows)</div>', unsafe_allow_html=True)
-    st.dataframe(pivot.head(15), use_container_width=True, hide_index=True)
+    st.markdown('<div class="section-head"><span>04</span> Preview (first 15 rows — flat view)</div>', unsafe_allow_html=True)
+    st.dataframe(preview_df.head(15), use_container_width=True, hide_index=True)
+    st.caption("ℹ️ Preview shows flat column names. The downloaded Excel has proper merged date headers with 3 sub-columns per date.")
 
     st.markdown('<div class="section-head"><span>05</span> Download</div>', unsafe_allow_html=True)
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button("⬇ Download Excel (.xlsx)",
-            data=st.session_state["xlsx_bytes"], file_name="employee_ct_pivoted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, key="dl_xlsx")
-    with dl2:
-        st.download_button("⬇ Download CSV (.csv)",
-            data=st.session_state["csv_bytes"], file_name="employee_ct_pivoted.csv",
-            mime="text/csv", use_container_width=True, key="dl_csv")
+    st.download_button(
+        "⬇ Download Excel (.xlsx) — with merged date headers",
+        data=st.session_state["xlsx_bytes"],
+        file_name="employee_ct_pivoted.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="dl_xlsx"
+    )
 
     with st.expander("🔍 Diagnostics"):
-        st.dataframe(deduped[["EMP_ID", "EMP_NAME", "WHEN_CHG", "CREATED", "CT_FINAL"]].head(20),
-            use_container_width=True, hide_index=True)
+        st.dataframe(
+            deduped[["EMP_ID", "EMP_NAME", "WHEN_CHG", "CREATED", "TOTAL_CT_NUM", "FIXED_CT_NUM", "VAR_PAY_NUM"]].head(20),
+            use_container_width=True, hide_index=True
+        )
         dup = deduped.groupby(["EMP_ID", "WHEN_KEY"]).size().reset_index(name="count")
         dup = dup[dup["count"] > 1].sort_values("count", ascending=False)
-        st.write("Duplicate keys (top 10):" if len(dup) else "No duplicates found.")
+        st.write("Duplicate keys (top 10):" if len(dup) else "✅ No duplicates found.")
         if len(dup):
             st.dataframe(dup.head(10), use_container_width=True, hide_index=True)
