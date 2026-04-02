@@ -173,8 +173,12 @@ def build_employee_records(df, col_map, dayfirst, auto_clean):
     4. Take top-3 records → Latest, 2nd Latest, 3rd Latest.
     5. Output 1 row per employee.
     """
-    work = df[list(col_map.values())].copy()
-    work.columns = list(col_map.keys())
+    # Build work df by mapping each logical key to its source column individually.
+    # This avoids bulk-rename failures when col_map.values() contains duplicates
+    # (e.g. multiple optional fields pointing to the same __ZERO__ column).
+    work = pd.DataFrame(index=df.index)
+    for key, src_col in col_map.items():
+        work[key] = df[src_col].values
 
     work["WHEN_DT"]    = try_parse_dates(work["when_change"], dayfirst=dayfirst)
     work["CREATED_DT"] = try_parse_dates(work["created_date"], dayfirst=dayfirst)
