@@ -9,7 +9,7 @@ import streamlit as st
 st.set_page_config(
     page_title="CT Data Transformer",
     page_icon="🔄",
-    layout="wide",
+    layout="wide",h
     initial_sidebar_state="collapsed"
 )
 
@@ -182,7 +182,8 @@ def build_employee_records(df, col_map, dayfirst, auto_clean, date_cutoff=None):
     # Build work df column-by-column to handle duplicate src cols safely.
     work = pd.DataFrame(index=df.index)
     for key, src_col in col_map.items():
-        work[key] = df[src_col].values
+        col_data = df[src_col]
+        work[key] = col_data.iloc[:, 0].values if isinstance(col_data, pd.DataFrame) else col_data.values
 
     work["WHEN_DT"]    = try_parse_dates(work["when_change"], dayfirst=dayfirst)
     work["CREATED_DT"] = try_parse_dates(work["created_date"], dayfirst=dayfirst)
