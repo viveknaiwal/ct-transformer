@@ -164,24 +164,38 @@ def safe_index(columns, value):
 
 # ── CORE TRANSFORM: 1 row per employee, Latest→2nd→3rd records side-by-side ──
 
-def build_employee_records(df, col_map, dayfirst, auto_clean):
+def build_employee_records(df, col_map, dayfirst, auto_clean, date_cutoff=None):
     """
     Logic mirrors the VBA macro exactly:
     1. For each employee, gather all records.
-    2. If any non-Discarded records exist, exclude Discarded ones.
-    3. Sort: Active first, then Archived, then by Created Date DESC.
-    4. Take top-3 records → Latest, 2nd Latest, 3rd Latest.
-    5. Output 1 row per employee.
+    2. Optionally filter rows where Effective Date < date_cutoff.
+    3. If any non-Discarded records exist, exclude Discarded ones.
+    4. Sort: Active first, then Archived, then by Created Date DESC.
+    5. Take top-3 records → Latest, 2nd Latest, 3rd Latest.
+    6. Output 1 row per employee.
     """
-    # Build work df by mapping each logical key to its source column individually.
-    # This avoids bulk-rename failures when col_map.values() contains duplicates
-    # (e.g. multiple optional fields pointing to the same __ZERO__ column).
+    # Reset index — critical when df arrived with a non-default index
+    # (e.g. after skiprows detection); .values assignment would silently
+    # misalign otherwise.
+    df = df.reset_index(drop=True)
+
+    # Build work df column-by-column to handle duplicate src cols safely.
     work = pd.DataFrame(index=df.index)
     for key, src_col in col_map.items():
         work[key] = df[src_col].values
 
     work["WHEN_DT"]    = try_parse_dates(work["when_change"], dayfirst=dayfirst)
     work["CREATED_DT"] = try_parse_dates(work["created_date"], dayfirst=dayfirst)
+
+    # Apply date cutoff filter if provided
+    if date_cutoff is not None:
+        cutoff_ts = pd.Timestamp(date_cutoff)
+        before    = work["WHEN_DT"] < cutoff_ts
+        dropped   = int(before.sum())
+        work      = work[~before].copy().reset_index(drop=True)
+        if dropped > 0:
+            import streamlit as _st
+            _st.info(f"🗑️ Removed {dropped:,} rows with Effective Date before {cutoff_ts.strftime('%d-%b-%Y')} · {len(work):,} rows remaining")
 
     num_cols = ["fixed_ctc", "total_pay", "variable_pay", "total_ctc", "perf_var", "ret_bonus", "perf_inc"]
     for c in num_cols:
@@ -538,6 +552,16 @@ col_opt1, col_opt2 = st.columns(2)
 with col_opt1: dayfirst   = st.checkbox("Dates are DD-MM-YYYY (day first)", value=True)
 with col_opt2: auto_clean = st.checkbox("Clean numeric fields (remove commas/currency)", value=True)
 
+fc1, _ = st.columns([1, 3])
+with fc1:
+    filter_date = st.date_input(
+        "Remove Change Dates before",
+        value=pd.Timestamp("2024-01-01"),
+        min_value=pd.Timestamp("2000-01-01"),
+        max_value=pd.Timestamp("2030-12-31"),
+        help="Rows with Effective Date before this date are excluded from all records"
+    )
+
 detected = {k: find_column(df.columns.tolist(), v) for k, v in COLUMN_CANDIDATES.items()}
 options_with_none = [None] + list(df.columns)
 
@@ -608,7 +632,7 @@ if st.button("⚡  Process & Generate Output", type="primary", use_container_wid
     }
 
     progress.progress(20, text="Transforming records…")
-    result_df = build_employee_records(df, col_map, dayfirst, auto_clean)
+    result_df = build_employee_records(df, col_map, dayfirst, auto_clean, date_cutoff=filter_date)
 
     progress.progress(65, text="Building Excel output…")
     xlsx_bytes = to_excel_bytes_output(result_df)
