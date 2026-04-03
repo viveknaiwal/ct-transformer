@@ -228,14 +228,14 @@ def build_employee_records(df, col_map, dayfirst, auto_clean, date_cutoff=None):
         pool["CRT_TS"] = pool["CREATED_DT"].values.astype("datetime64[ns]").astype("int64")
         pool = pool.sort_values(["STATUS_RANK", "CRT_TS"], ascending=[True, False])
 
-        top3 = pool.head(3).reset_index(drop=True)
+        top5 = pool.head(5).reset_index(drop=True)
 
         row = {
             "EMP ID":         emp_id,
-            "Employee Name":  top3.loc[0, "emp_name"] if len(top3) > 0 else "",
+            "Employee Name":  top5.loc[0, "emp_name"] if len(top5) > 0 else "",
         }
 
-        labels = ["LATEST / ACTIVE RECORD", "2nd LATEST RECORD", "3rd LATEST RECORD"]
+        labels = ["LATEST / ACTIVE RECORD", "2nd LATEST RECORD", "3rd LATEST RECORD", "4th LATEST RECORD", "5th LATEST RECORD"]
         fields = [
             ("Effective Date",  "WHEN_DT"),
             ("Fixed CTC",       "fixed_ctc_N"),
@@ -248,8 +248,8 @@ def build_employee_records(df, col_map, dayfirst, auto_clean, date_cutoff=None):
         ]
 
         for i, label in enumerate(labels):
-            if i < len(top3):
-                r = top3.iloc[i]
+            if i < len(top5):
+                r = top5.iloc[i]
                 for fname, fkey in fields:
                     col_name = f"{label} | {fname}"
                     val = r[fkey]
@@ -313,6 +313,18 @@ def to_excel_bytes_output(result_df):
         "bg_color": "#375623", "font_color": "#FFFFFF",
         "align": "center", "valign": "vcenter", "border": 1
     })
+    # Group header — 4th Latest (purple tones)
+    fmt_grp_4th = wb.add_format({
+        "bold": True, "font_size": 10, "font_name": "Arial",
+        "bg_color": "#7030A0", "font_color": "#FFFFFF",
+        "align": "center", "valign": "vcenter", "border": 1
+    })
+    # Group header — 5th Latest (teal tones)
+    fmt_grp_5th = wb.add_format({
+        "bold": True, "font_size": 10, "font_name": "Arial",
+        "bg_color": "#006B6B", "font_color": "#FFFFFF",
+        "align": "center", "valign": "vcenter", "border": 1
+    })
     # Separator column
     fmt_sep = wb.add_format({
         "bg_color": "#F2F2F2", "border": 1
@@ -330,6 +342,8 @@ def to_excel_bytes_output(result_df):
     fmt_sub_lat   = sub_hdr("#DEEAF1")
     fmt_sub_2nd   = sub_hdr("#FCE4D6")
     fmt_sub_3rd   = sub_hdr("#E2EFDA")
+    fmt_sub_4th   = sub_hdr("#E8D5F5")
+    fmt_sub_5th   = sub_hdr("#D0EDED")
 
     # Data formats
     def data_fmt(bg, num=False):
@@ -359,6 +373,21 @@ def to_excel_bytes_output(result_df):
     fmt_3rd_odd_txt  = data_fmt("#F0F7EC")
     fmt_3rd_even_num = data_fmt("#E2EFDA", num=True)
     fmt_3rd_odd_num  = data_fmt("#F0F7EC", num=True)
+    # 4th: purple
+    fmt_4th_even_txt = data_fmt("#E8D5F5")
+    fmt_4th_odd_txt  = data_fmt("#F3EAFA")
+    fmt_4th_even_num = data_fmt("#E8D5F5", num=True)
+    fmt_4th_odd_num  = data_fmt("#F3EAFA", num=True)
+    # 5th: teal
+    fmt_5th_even_txt = data_fmt("#D0EDED")
+    fmt_5th_odd_txt  = data_fmt("#E4F5F5")
+    fmt_5th_even_num = data_fmt("#D0EDED", num=True)
+    fmt_5th_odd_num  = data_fmt("#E4F5F5", num=True)
+    # Date formats for 4th and 5th
+    fmt_date_4th_even = wb.add_format({"font_size": 10, "font_name": "Arial", "bg_color": "#E8D5F5", "align": "center", "valign": "vcenter", "border": 1, "border_color": "#B4B4B4"})
+    fmt_date_4th_odd  = wb.add_format({"font_size": 10, "font_name": "Arial", "bg_color": "#F3EAFA", "align": "center", "valign": "vcenter", "border": 1, "border_color": "#B4B4B4"})
+    fmt_date_5th_even = wb.add_format({"font_size": 10, "font_name": "Arial", "bg_color": "#D0EDED", "align": "center", "valign": "vcenter", "border": 1, "border_color": "#B4B4B4"})
+    fmt_date_5th_odd  = wb.add_format({"font_size": 10, "font_name": "Arial", "bg_color": "#E4F5F5", "align": "center", "valign": "vcenter", "border": 1, "border_color": "#B4B4B4"})
     # EMP cols: solid blue
     fmt_emp_even = data_fmt("#BDD7EE")
     fmt_emp_odd  = data_fmt("#DEEAF1")
@@ -387,11 +416,17 @@ def to_excel_bytes_output(result_df):
     ws.set_column(20, 20, 3)   # separator
     ws.set_column(21, 21, 14)  # Eff Date (3rd)
     ws.set_column(22, 28, 14)  # 3rd numeric cols
+    ws.set_column(29, 29, 3)   # separator
+    ws.set_column(30, 30, 14)  # Eff Date (4th)
+    ws.set_column(31, 37, 14)  # 4th numeric cols
+    ws.set_column(38, 38, 3)   # separator
+    ws.set_column(39, 39, 14)  # Eff Date (5th)
+    ws.set_column(40, 46, 14)  # 5th numeric cols
 
     # ── ROW 0: Title banner ───────────────────────────────────────────────────
     ws.set_row(0, 20)
-    ws.merge_range(0, 0, 0, 28,
-        "CTC TRANSFORMATION OUTPUT  —  1 Row per Employee  |  Latest → 2nd Latest → 3rd Latest",
+    ws.merge_range(0, 0, 0, 46,
+        "CTC TRANSFORMATION OUTPUT  —  1 Row per Employee  |  Latest → 2nd → 3rd → 4th → 5th Latest",
         fmt_title)
 
     # ── ROW 1: Group headers ──────────────────────────────────────────────────
@@ -402,6 +437,10 @@ def to_excel_bytes_output(result_df):
     ws.merge_range(1, 12, 1, 19, "2nd LATEST RECORD",     fmt_grp_2nd)
     ws.write(1, 20, "", fmt_sep)
     ws.merge_range(1, 21, 1, 28, "3rd LATEST RECORD",     fmt_grp_3rd)
+    ws.write(1, 29, "", fmt_sep)
+    ws.merge_range(1, 30, 1, 37, "4th LATEST RECORD",     fmt_grp_4th)
+    ws.write(1, 38, "", fmt_sep)
+    ws.merge_range(1, 39, 1, 46, "5th LATEST RECORD",     fmt_grp_5th)
 
     # ── ROW 2: Sub-headers ────────────────────────────────────────────────────
     ws.set_row(2, 30)
@@ -419,15 +458,21 @@ def to_excel_bytes_output(result_df):
     ws.write(2, 20, "", fmt_sep)
     for j, lbl in enumerate(sub_labels):
         ws.write(2, 21 + j, lbl, fmt_sub_3rd)
+    ws.write(2, 29, "", fmt_sep)
+    for j, lbl in enumerate(sub_labels):
+        ws.write(2, 30 + j, lbl, fmt_sub_4th)
+    ws.write(2, 38, "", fmt_sep)
+    for j, lbl in enumerate(sub_labels):
+        ws.write(2, 39 + j, lbl, fmt_sub_5th)
 
     ws.freeze_panes(3, 3)
 
     # ── DATA ROWS ─────────────────────────────────────────────────────────────
-    labels = ["LATEST / ACTIVE RECORD", "2nd LATEST RECORD", "3rd LATEST RECORD"]
+    labels = ["LATEST / ACTIVE RECORD", "2nd LATEST RECORD", "3rd LATEST RECORD", "4th LATEST RECORD", "5th LATEST RECORD"]
     field_names = ["Effective Date", "Fixed CTC", "Total Pay", "Total Var. Pay",
                    "Total CTC", "Perf. Linked Var.", "Retention Bonus", "Perf. Linked Inc."]
-    start_cols = [3, 12, 21]
-    sep_cols   = [11, 20]
+    start_cols = [3, 12, 21, 30, 39]
+    sep_cols   = [11, 20, 29, 38]
 
     for ri, row_data in result_df.iterrows():
         xl_row = ri + 3
@@ -443,7 +488,7 @@ def to_excel_bytes_output(result_df):
         for sc in sep_cols:
             ws.write(xl_row, sc, "", fmt_sep)
 
-        # 3 record groups
+        # 5 record groups
         for gi, label in enumerate(labels):
             sc = start_cols[gi]
             # Date
@@ -456,10 +501,18 @@ def to_excel_bytes_output(result_df):
                 date_fmt = fmt_date_2nd_even if even else fmt_date_2nd_odd
                 num_fmt_txt = fmt_2nd_even_txt  if even else fmt_2nd_odd_txt
                 num_fmt_num = fmt_2nd_even_num  if even else fmt_2nd_odd_num
-            else:
+            elif gi == 2:
                 date_fmt = fmt_date_3rd_even if even else fmt_date_3rd_odd
                 num_fmt_txt = fmt_3rd_even_txt  if even else fmt_3rd_odd_txt
                 num_fmt_num = fmt_3rd_even_num  if even else fmt_3rd_odd_num
+            elif gi == 3:
+                date_fmt = fmt_date_4th_even if even else fmt_date_4th_odd
+                num_fmt_txt = fmt_4th_even_txt  if even else fmt_4th_odd_txt
+                num_fmt_num = fmt_4th_even_num  if even else fmt_4th_odd_num
+            else:
+                date_fmt = fmt_date_5th_even if even else fmt_date_5th_odd
+                num_fmt_txt = fmt_5th_even_txt  if even else fmt_5th_odd_txt
+                num_fmt_num = fmt_5th_even_num  if even else fmt_5th_odd_num
 
             ws.write(xl_row, sc, date_val, date_fmt)
 
@@ -486,8 +539,7 @@ st.markdown(f"""
   <div class="hero-user">{'👑 ' if is_admin else ''}<strong>{user_email}</strong>{admin_badge}</div>
   <div class="hero-label">Payroll Internal Tool</div>
   <div class="hero-title">CT Data <strong>Transformer</strong></div>
-  <div class="hero-sub">Upload your employee CT file. Outputs 1 row per employee with Latest, 2nd Latest,
-  and 3rd Latest CTC records side-by-side — matching the Output sheet format.</div>
+  <div class="hero-sub">Upload your employee CT file. Outputs 1 row per employee with Latest, 2nd, 3rd, 4th, and 5th Latest CTC records side-by-side — matching the Output sheet format.</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -658,8 +710,8 @@ if "result_df" in st.session_state:
     <div class="metric-row">
       <div class="metric-card"><div class="metric-val">{total_rows:,}</div><div class="metric-label">Input Rows</div></div>
       <div class="metric-card"><div class="metric-val">{n_emp:,}</div><div class="metric-label">Unique Employees</div></div>
-      <div class="metric-card"><div class="metric-val">3</div><div class="metric-label">Records Per Employee</div></div>
-      <div class="metric-card"><div class="metric-val">29</div><div class="metric-label">Output Columns</div></div>
+      <div class="metric-card"><div class="metric-val">5</div><div class="metric-label">Records Per Employee</div></div>
+      <div class="metric-card"><div class="metric-val">47</div><div class="metric-label">Output Columns</div></div>
     </div>
     """, unsafe_allow_html=True)
 
